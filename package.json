@@ -1,0 +1,24 @@
+{
+  "name": "openclaw-langfuse-plugin",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin for Langfuse LLM observability — traces every agent turn with per-LLM-call generations, accurate model/provider info, token usage, and cost tracking. Zero dependencies, drop-in install.",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "openclaw",
+    "langfuse",
+    "llm",
+    "observability",
+    "tracing",
+    "ai-agents",
+    "monitoring"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openclaw/openclaw-langfuse-plugin"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
