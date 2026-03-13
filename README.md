@@ -2,16 +2,16 @@
 
 English | [中文](./README.zh-CN.md)
 
-OpenClaw plugin for [Langfuse](https://langfuse.com) LLM observability.
+Full observability plugin for [OpenClaw](https://github.com/openclaw/openclaw) via [Langfuse](https://langfuse.com).
 
-Traces every agent turn with **per-LLM-call generations**, accurate model/provider info, structured token usage (including cache hits), and latency tracking.
+Traces every agent turn with per-LLM-call generations, tool call spans, sub-agent lifecycle, session events, and compaction tracking.
 
 - **Zero npm dependencies** — uses the Langfuse REST API directly via native `fetch`.
 - **No image rebuild required** — drop the plugin folder into your extensions directory and restart.
 
 ## What it records
 
-### Per agent turn (trace)
+### Trace (per agent turn)
 
 | Field | Value |
 |-------|-------|
@@ -23,7 +23,7 @@ Traces every agent turn with **per-LLM-call generations**, accurate model/provid
 | Output | The agent's final response |
 | Metadata | `success`, `error`, `durationMs`, `messageCount`, `channelId`, `trigger` |
 
-### Per LLM call (generation)
+### Generation (per LLM call)
 
 | Field | Value |
 |-------|-------|
@@ -32,10 +32,51 @@ Traces every agent turn with **per-LLM-call generations**, accurate model/provid
 | Provider | `anthropic`, `openai`, `ollama`, etc. |
 | Input | System prompt + user prompt |
 | Output | Full assistant response text |
-| Token usage | `input`, `output`, `inputCached` (cache read), `total` |
+| Token usage | `input`, `output`, `inputCached`, `inputCacheWrite`, `total` |
 | Duration | Per-call start → end time |
 
-If an agent turn involves multiple LLM calls (e.g. tool-use loops), each call appears as a separate generation nested under the same trace.
+### Span (per tool call)
+
+| Field | Value |
+|-------|-------|
+| Name | `tool: <toolName>` (e.g. `tool: exec`, `tool: read`) |
+| Input | Tool call parameters (JSON) |
+| Output | Tool result or error |
+| Level | `DEFAULT` on success, `ERROR` on failure |
+| Duration | Per-call start → end time |
+
+### Span (per sub-agent)
+
+| Field | Value |
+|-------|-------|
+| Name | `subagent: <label or agentId>` |
+| Level | `ERROR` on error/timeout/killed, `DEFAULT` otherwise |
+| Metadata | `targetSessionKey`, `targetKind`, `outcome`, `reason` |
+
+### Events
+
+| Event | When |
+|-------|------|
+| `session_start` | New session created or resumed |
+| `session_end` | Session ends (includes `messageCount`, `durationMs`) |
+| `compaction_start` | Context compaction begins (includes `messageCount`, `tokenCount`) |
+| `compaction_end` | Context compaction finishes (includes `compactedCount`) |
+
+### Trace structure in Langfuse
+
+```
+trace (openclaw-turn)
+  ├── generation (anthropic/claude-4-opus)     # 1st LLM call
+  ├── span (tool: exec)                        # tool call
+  ├── generation (anthropic/claude-4-opus)     # 2nd LLM call (after tool result)
+  ├── span (tool: read)                        # another tool call
+  ├── generation (anthropic/claude-4-opus)     # 3rd LLM call
+  ├── span (subagent: researcher)              # sub-agent lifecycle
+  ├── event (compaction_start)                 # context compaction
+  ├── event (compaction_end)
+  ├── event (session_start)
+  └── event (session_end)
+```
 
 ## Installation
 
@@ -43,7 +84,7 @@ If an agent turn involves multiple LLM calls (e.g. tool-use loops), each call ap
 
 ```bash
 cd ~/.openclaw/extensions   # or {workspaceDir}/.openclaw/extensions
-git clone https://github.com/openclaw/openclaw-langfuse-plugin.git openclaw-langfuse-plugin
+git clone https://github.com/widwei/openclaw-langfuse-plugin.git openclaw-langfuse-plugin
 ```
 
 ### Option 2: Copy manually
@@ -56,7 +97,6 @@ cp index.js openclaw.plugin.json ~/.openclaw/extensions/openclaw-langfuse-plugin
 ### Option 3: Docker volume mount
 
 ```bash
-# Copy into your workspace volume
 tar -czf - openclaw-langfuse-plugin/ | ssh user@your-host \
   'cd /path/to/openclaw/workspace/.openclaw/extensions && tar -xzf -'
 ```
@@ -71,8 +111,6 @@ The plugin auto-discovers at startup from:
 
 ### Environment variables
 
-Add these to your OpenClaw gateway environment:
-
 ```bash
 LANGFUSE_PUBLIC_KEY=pk-lf-xxxxxxxxxxxxxxxxxxxx
 LANGFUSE_SECRET_KEY=sk-lf-xxxxxxxxxxxxxxxxxxxx
@@ -86,7 +124,7 @@ In your `openclaw.json`:
 ```json
 {
   "plugins": {
-      "openclaw-langfuse-plugin": {
+    "openclaw-langfuse-plugin": {
       "publicKey": "pk-lf-xxxxxxxxxxxxxxxxxxxx",
       "secretKey": "sk-lf-xxxxxxxxxxxxxxxxxxxx",
       "baseUrl": "https://cloud.langfuse.com"
@@ -133,14 +171,16 @@ If keys are missing:
 
 ## How it works
 
-The plugin registers four hooks:
+The plugin registers 12 hooks across 6 categories:
 
-| Hook | Purpose |
-|------|---------|
-| `before_agent_start` | Captures the user prompt and creates a trace ID |
-| `llm_input` | Records provider, model, prompt before each LLM call |
-| `llm_output` | Pairs with `llm_input`, sends `generation-create` to Langfuse with token usage |
-| `agent_end` | Sends `trace-create` to Langfuse with overall success/error status |
+| Category | Hooks | Langfuse event type |
+|----------|-------|---------------------|
+| Trace lifecycle | `before_agent_start`, `agent_end` | `trace-create` |
+| LLM calls | `llm_input`, `llm_output` | `generation-create` |
+| Tool calls | `before_tool_call`, `after_tool_call` | `span-create` |
+| Sessions | `session_start`, `session_end` | `event-create` |
+| Compaction | `before_compaction`, `after_compaction` | `event-create` |
+| Sub-agents | `subagent_spawned`, `subagent_ended` | `span-create` |
 
 The plugin **fails silently** — if keys are missing, Langfuse is unreachable, or an ingestion call fails, it logs a warning and continues. It never blocks the agent.
 

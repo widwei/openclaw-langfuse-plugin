@@ -1,11 +1,14 @@
 /**
- * openclaw-langfuse — OpenClaw plugin for Langfuse LLM observability
- * https://github.com/openclaw/openclaw-langfuse-plugin
+ * openclaw-langfuse-plugin — Full observability for OpenClaw via Langfuse
+ * https://github.com/widwei/openclaw-langfuse-plugin
  *
- * Sends structured traces and per-LLM-call generations to Langfuse using
- * the llm_input / llm_output hooks for accurate model, provider, and token
- * tracking. Falls back to before_agent_start / agent_end for the trace
- * envelope.
+ * Hooks:
+ *   before_agent_start / agent_end     → trace lifecycle
+ *   llm_input / llm_output             → per-LLM-call generations
+ *   before_tool_call / after_tool_call  → tool call spans
+ *   session_start / session_end         → session lifecycle events
+ *   before_compaction / after_compaction → compaction events
+ *   subagent_spawned / subagent_ended   → sub-agent lifecycle spans
  *
  * Zero npm dependencies — uses the Langfuse REST ingestion API via native fetch.
  *
@@ -17,13 +20,11 @@
 
 const MAX_TEXT_LEN = 50_000;
 
-/** @param {string | undefined} text */
 function truncate(text, limit = MAX_TEXT_LEN) {
   if (!text) return undefined;
   return text.length > limit ? text.slice(0, limit) : text;
 }
 
-/** @param {unknown} content */
 function extractText(content, maxLen = MAX_TEXT_LEN) {
   if (typeof content === "string") return content.slice(0, maxLen);
   if (Array.isArray(content)) {
@@ -36,12 +37,20 @@ function extractText(content, maxLen = MAX_TEXT_LEN) {
   return "";
 }
 
-/** @param {{ sessionKey?: string; agentId?: string }} ctx */
 function resolveKey(ctx) {
   return ctx.sessionKey ?? ctx.agentId ?? "default";
 }
 
-/** @param {import("openclaw").OpenClawPluginApi} api */
+function safeStringify(value, maxLen = 2000) {
+  if (value === undefined || value === null) return undefined;
+  try {
+    const str = typeof value === "string" ? value : JSON.stringify(value);
+    return str.length > maxLen ? str.slice(0, maxLen) + "…" : str;
+  } catch {
+    return String(value).slice(0, maxLen);
+  }
+}
+
 export function register(api) {
   const pluginCfg = api.pluginConfig ?? {};
 
@@ -59,15 +68,24 @@ export function register(api) {
   const authHeader = "Basic " + Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
   api.logger.info(`[openclaw-langfuse] Langfuse tracing enabled → ${baseUrl}`);
 
-  // Per-session trace state: keyed by sessionKey (or agentId fallback).
+  // ── State maps ──
+
   /** @type {Map<string, { traceId: string; startedAt: number; prompt: string }>} */
   const pendingTraces = new Map();
 
-  // Per-runId LLM call state: captures provider/model from llm_input → llm_output.
   /** @type {Map<string, { generationId: string; provider: string; model: string; startedAt: number; prompt: string; systemPrompt?: string }>} */
   const pendingLlmCalls = new Map();
 
-  // ── before_agent_start: capture prompt + start time for the trace envelope ──
+  /** @type {Map<string, { spanId: string; startedAt: number }>} */
+  const pendingToolCalls = new Map();
+
+  /** @type {Map<string, { spanId: string; startedAt: number; childSessionKey: string; agentId: string; label?: string }>} */
+  const pendingSubagents = new Map();
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // 1. Trace lifecycle: before_agent_start → agent_end
+  // ════════════════════════════════════════════════════════════════════════════
+
   api.on("before_agent_start", (event, ctx) => {
     const key = resolveKey(ctx);
     pendingTraces.set(key, {
@@ -77,73 +95,6 @@ export function register(api) {
     });
   });
 
-  // ── llm_input: capture provider, model, prompt before each LLM call ──
-  api.on("llm_input", (event) => {
-    pendingLlmCalls.set(event.runId, {
-      generationId: crypto.randomUUID(),
-      provider: event.provider,
-      model: event.model,
-      startedAt: Date.now(),
-      prompt: event.prompt,
-      systemPrompt: event.systemPrompt,
-    });
-  });
-
-  // ── llm_output: pair with llm_input, send generation to Langfuse ──
-  api.on("llm_output", async (event, ctx) => {
-    const call = pendingLlmCalls.get(event.runId);
-    pendingLlmCalls.delete(event.runId);
-    if (!call) return;
-
-    const key = resolveKey(ctx);
-    const trace = pendingTraces.get(key);
-    const traceId = trace?.traceId ?? crypto.randomUUID();
-
-    const now = new Date().toISOString();
-    const startTime = new Date(call.startedAt).toISOString();
-    const outputText = event.assistantTexts?.join("\n") ?? "";
-
-    const usage = {};
-    if (event.usage) {
-      if (typeof event.usage.input === "number") usage.input = event.usage.input;
-      if (typeof event.usage.output === "number") usage.output = event.usage.output;
-      if (typeof event.usage.cacheRead === "number") usage.inputCached = event.usage.cacheRead;
-      if (typeof event.usage.total === "number") usage.total = event.usage.total;
-      usage.unit = "TOKENS";
-    }
-
-    const inputText = call.systemPrompt
-      ? `[system] ${call.systemPrompt}\n\n${call.prompt}`
-      : call.prompt;
-
-    await sendBatch([
-      {
-        id: crypto.randomUUID(),
-        type: "generation-create",
-        timestamp: now,
-        body: {
-          id: call.generationId,
-          traceId,
-          name: `${call.provider}/${call.model}`,
-          model: call.model,
-          modelParameters: { provider: call.provider },
-          startTime,
-          endTime: now,
-          input: truncate(inputText),
-          output: truncate(outputText),
-          usage: Object.keys(usage).length > 1 ? usage : undefined,
-          level: "DEFAULT",
-          metadata: {
-            provider: call.provider,
-            agentId: ctx.agentId,
-            sessionKey: ctx.sessionKey,
-          },
-        },
-      },
-    ]);
-  });
-
-  // ── agent_end: finalize the trace with overall success/error status ──
   api.on("agent_end", async (event, ctx) => {
     const key = resolveKey(ctx);
     const trace = pendingTraces.get(key);
@@ -191,7 +142,297 @@ export function register(api) {
     ]);
   });
 
-  // ── Langfuse ingestion helper ──
+  // ════════════════════════════════════════════════════════════════════════════
+  // 2. LLM calls: llm_input → llm_output (generation-create)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  api.on("llm_input", (event) => {
+    pendingLlmCalls.set(event.runId, {
+      generationId: crypto.randomUUID(),
+      provider: event.provider,
+      model: event.model,
+      startedAt: Date.now(),
+      prompt: event.prompt,
+      systemPrompt: event.systemPrompt,
+    });
+  });
+
+  api.on("llm_output", async (event, ctx) => {
+    const call = pendingLlmCalls.get(event.runId);
+    pendingLlmCalls.delete(event.runId);
+    if (!call) return;
+
+    const key = resolveKey(ctx);
+    const trace = pendingTraces.get(key);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+
+    const now = new Date().toISOString();
+    const startTime = new Date(call.startedAt).toISOString();
+    const outputText = event.assistantTexts?.join("\n") ?? "";
+
+    const usage = {};
+    if (event.usage) {
+      if (typeof event.usage.input === "number") usage.input = event.usage.input;
+      if (typeof event.usage.output === "number") usage.output = event.usage.output;
+      if (typeof event.usage.cacheRead === "number") usage.inputCached = event.usage.cacheRead;
+      if (typeof event.usage.cacheWrite === "number") usage.inputCacheWrite = event.usage.cacheWrite;
+      if (typeof event.usage.total === "number") usage.total = event.usage.total;
+      usage.unit = "TOKENS";
+    }
+
+    const inputText = call.systemPrompt
+      ? `[system] ${call.systemPrompt}\n\n${call.prompt}`
+      : call.prompt;
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "generation-create",
+        timestamp: now,
+        body: {
+          id: call.generationId,
+          traceId,
+          name: `${call.provider}/${call.model}`,
+          model: call.model,
+          modelParameters: { provider: call.provider },
+          startTime,
+          endTime: now,
+          input: truncate(inputText),
+          output: truncate(outputText),
+          usage: Object.keys(usage).length > 1 ? usage : undefined,
+          level: "DEFAULT",
+          metadata: {
+            provider: call.provider,
+            agentId: ctx.agentId,
+            sessionKey: ctx.sessionKey,
+          },
+        },
+      },
+    ]);
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // 3. Tool calls: before_tool_call → after_tool_call (span-create)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  api.on("before_tool_call", (event, ctx) => {
+    const spanKey = `${ctx.runId ?? ""}:${ctx.toolCallId ?? crypto.randomUUID()}`;
+    pendingToolCalls.set(spanKey, {
+      spanId: crypto.randomUUID(),
+      startedAt: Date.now(),
+    });
+  });
+
+  api.on("after_tool_call", async (event, ctx) => {
+    const spanKey = `${ctx.runId ?? ""}:${ctx.toolCallId ?? ""}`;
+    const pending = pendingToolCalls.get(spanKey);
+    pendingToolCalls.delete(spanKey);
+
+    const traceKey = resolveKey(ctx);
+    const trace = pendingTraces.get(traceKey);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+    const spanId = pending?.spanId ?? crypto.randomUUID();
+
+    const now = new Date().toISOString();
+    const startTime = pending ? new Date(pending.startedAt).toISOString() : now;
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "span-create",
+        timestamp: now,
+        body: {
+          id: spanId,
+          traceId,
+          name: `tool: ${event.toolName}`,
+          startTime,
+          endTime: now,
+          input: safeStringify(event.params),
+          output: event.error ? safeStringify(event.error) : safeStringify(event.result),
+          level: event.error ? "ERROR" : "DEFAULT",
+          statusMessage: event.error ?? undefined,
+          metadata: {
+            toolName: event.toolName,
+            durationMs: event.durationMs,
+            agentId: ctx.agentId,
+            runId: ctx.runId,
+          },
+        },
+      },
+    ]);
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // 4. Session lifecycle: session_start / session_end (event-create)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  api.on("session_start", async (event, ctx) => {
+    const traceKey = ctx.sessionKey ?? ctx.agentId ?? "default";
+    const trace = pendingTraces.get(traceKey);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "event-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: crypto.randomUUID(),
+          traceId,
+          name: "session_start",
+          startTime: new Date().toISOString(),
+          metadata: {
+            sessionId: event.sessionId,
+            sessionKey: event.sessionKey,
+            resumedFrom: event.resumedFrom ?? undefined,
+            agentId: ctx.agentId,
+          },
+        },
+      },
+    ]);
+  });
+
+  api.on("session_end", async (event, ctx) => {
+    const traceKey = ctx.sessionKey ?? ctx.agentId ?? "default";
+    const trace = pendingTraces.get(traceKey);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "event-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: crypto.randomUUID(),
+          traceId,
+          name: "session_end",
+          startTime: new Date().toISOString(),
+          metadata: {
+            sessionId: event.sessionId,
+            sessionKey: event.sessionKey,
+            messageCount: event.messageCount,
+            durationMs: event.durationMs,
+            agentId: ctx.agentId,
+          },
+        },
+      },
+    ]);
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // 5. Compaction: before_compaction / after_compaction (event-create)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  api.on("before_compaction", async (event, ctx) => {
+    const traceKey = resolveKey(ctx);
+    const trace = pendingTraces.get(traceKey);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "event-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: crypto.randomUUID(),
+          traceId,
+          name: "compaction_start",
+          startTime: new Date().toISOString(),
+          metadata: {
+            messageCount: event.messageCount,
+            compactingCount: event.compactingCount,
+            tokenCount: event.tokenCount,
+            agentId: ctx.agentId,
+          },
+        },
+      },
+    ]);
+  });
+
+  api.on("after_compaction", async (event, ctx) => {
+    const traceKey = resolveKey(ctx);
+    const trace = pendingTraces.get(traceKey);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "event-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: crypto.randomUUID(),
+          traceId,
+          name: "compaction_end",
+          startTime: new Date().toISOString(),
+          metadata: {
+            messageCount: event.messageCount,
+            compactedCount: event.compactedCount,
+            tokenCount: event.tokenCount,
+            agentId: ctx.agentId,
+          },
+        },
+      },
+    ]);
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // 6. Sub-agents: subagent_spawned / subagent_ended (span-create)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  api.on("subagent_spawned", (event, ctx) => {
+    pendingSubagents.set(event.childSessionKey, {
+      spanId: crypto.randomUUID(),
+      startedAt: Date.now(),
+      childSessionKey: event.childSessionKey,
+      agentId: event.agentId,
+      label: event.label,
+    });
+  });
+
+  api.on("subagent_ended", async (event, ctx) => {
+    const pending = pendingSubagents.get(event.targetSessionKey);
+    pendingSubagents.delete(event.targetSessionKey);
+
+    const traceKey = ctx.requesterSessionKey ?? "default";
+    const trace = pendingTraces.get(traceKey);
+    const traceId = trace?.traceId ?? crypto.randomUUID();
+    const spanId = pending?.spanId ?? crypto.randomUUID();
+
+    const now = new Date().toISOString();
+    const startTime = pending ? new Date(pending.startedAt).toISOString() : now;
+    const isError = event.outcome === "error" || event.outcome === "timeout" || event.outcome === "killed";
+
+    await sendBatch([
+      {
+        id: crypto.randomUUID(),
+        type: "span-create",
+        timestamp: now,
+        body: {
+          id: spanId,
+          traceId,
+          name: `subagent: ${pending?.label || pending?.agentId || event.targetSessionKey}`,
+          startTime,
+          endTime: event.endedAt ? new Date(event.endedAt).toISOString() : now,
+          level: isError ? "ERROR" : "DEFAULT",
+          statusMessage: event.error ?? undefined,
+          metadata: {
+            targetSessionKey: event.targetSessionKey,
+            targetKind: event.targetKind,
+            reason: event.reason,
+            outcome: event.outcome,
+            runId: event.runId,
+            agentId: pending?.agentId,
+            label: pending?.label,
+          },
+        },
+      },
+    ]);
+  });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // Langfuse ingestion helper
+  // ════════════════════════════════════════════════════════════════════════════
+
   async function sendBatch(batch) {
     try {
       const res = await fetch(`${baseUrl}/api/public/ingestion`, {

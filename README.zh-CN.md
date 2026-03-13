@@ -2,16 +2,16 @@
 
 [English](./README.md) | 中文
 
-OpenClaw 的 [Langfuse](https://langfuse.com) LLM 可观测性插件。
+[OpenClaw](https://github.com/openclaw/openclaw) 的 [Langfuse](https://langfuse.com) 全链路可观测性插件。
 
-为每次 agent 对话记录 **逐次 LLM 调用的 generation**，包含精确的模型/提供商信息、结构化的 token 用量（含缓存命中）和延迟追踪。
+为每次 agent 对话记录逐次 LLM 调用的 generation、工具调用 span、子 agent 生命周期、会话事件和上下文压缩追踪。
 
 - **零 npm 依赖** — 通过原生 `fetch` 直接调用 Langfuse REST API
 - **无需重新构建镜像** — 将插件文件夹放入 extensions 目录，重启即可
 
 ## 记录内容
 
-### 每次 agent 对话（trace）
+### Trace（每次 agent 对话）
 
 | 字段 | 值 |
 |------|-----|
@@ -23,7 +23,7 @@ OpenClaw 的 [Langfuse](https://langfuse.com) LLM 可观测性插件。
 | Output | agent 最终回复 |
 | Metadata | `success`、`error`、`durationMs`、`messageCount`、`channelId`、`trigger` |
 
-### 每次 LLM 调用（generation）
+### Generation（每次 LLM 调用）
 
 | 字段 | 值 |
 |------|-----|
@@ -32,10 +32,51 @@ OpenClaw 的 [Langfuse](https://langfuse.com) LLM 可观测性插件。
 | Provider | `anthropic`、`openai`、`ollama` 等 |
 | Input | 系统提示词 + 用户提示词 |
 | Output | 完整的助手回复文本 |
-| Token 用量 | `input`、`output`、`inputCached`（缓存读取）、`total` |
+| Token 用量 | `input`、`output`、`inputCached`、`inputCacheWrite`、`total` |
 | 耗时 | 单次调用的起止时间 |
 
-如果一次 agent 对话涉及多次 LLM 调用（如 tool-use 循环），每次调用都会作为独立的 generation 嵌套在同一个 trace 下。
+### Span（每次工具调用）
+
+| 字段 | 值 |
+|------|-----|
+| 名称 | `tool: <toolName>`（如 `tool: exec`、`tool: read`） |
+| Input | 工具调用参数（JSON） |
+| Output | 工具返回结果或错误 |
+| Level | 成功为 `DEFAULT`，失败为 `ERROR` |
+| 耗时 | 单次调用的起止时间 |
+
+### Span（每个子 agent）
+
+| 字段 | 值 |
+|------|-----|
+| 名称 | `subagent: <label 或 agentId>` |
+| Level | 错误/超时/被终止时为 `ERROR`，其他为 `DEFAULT` |
+| Metadata | `targetSessionKey`、`targetKind`、`outcome`、`reason` |
+
+### 事件
+
+| 事件 | 触发时机 |
+|------|----------|
+| `session_start` | 新会话创建或恢复 |
+| `session_end` | 会话结束（包含 `messageCount`、`durationMs`） |
+| `compaction_start` | 上下文压缩开始（包含 `messageCount`、`tokenCount`） |
+| `compaction_end` | 上下文压缩完成（包含 `compactedCount`） |
+
+### Langfuse 中的 Trace 结构
+
+```
+trace (openclaw-turn)
+  ├── generation (anthropic/claude-4-opus)     # 第 1 次 LLM 调用
+  ├── span (tool: exec)                        # 工具调用
+  ├── generation (anthropic/claude-4-opus)     # 第 2 次 LLM 调用（工具结果后）
+  ├── span (tool: read)                        # 另一个工具调用
+  ├── generation (anthropic/claude-4-opus)     # 第 3 次 LLM 调用
+  ├── span (subagent: researcher)              # 子 agent 生命周期
+  ├── event (compaction_start)                 # 上下文压缩
+  ├── event (compaction_end)
+  ├── event (session_start)
+  └── event (session_end)
+```
 
 ## 安装
 
@@ -43,7 +84,7 @@ OpenClaw 的 [Langfuse](https://langfuse.com) LLM 可观测性插件。
 
 ```bash
 cd ~/.openclaw/extensions   # 或 {workspaceDir}/.openclaw/extensions
-git clone https://github.com/openclaw/openclaw-langfuse-plugin.git openclaw-langfuse-plugin
+git clone https://github.com/widwei/openclaw-langfuse-plugin.git openclaw-langfuse-plugin
 ```
 
 ### 方式二：手动复制
@@ -56,7 +97,6 @@ cp index.js openclaw.plugin.json ~/.openclaw/extensions/openclaw-langfuse-plugin
 ### 方式三：Docker 卷挂载
 
 ```bash
-# 复制到你的 workspace 卷
 tar -czf - openclaw-langfuse-plugin/ | ssh user@your-host \
   'cd /path/to/openclaw/workspace/.openclaw/extensions && tar -xzf -'
 ```
@@ -70,8 +110,6 @@ tar -czf - openclaw-langfuse-plugin/ | ssh user@your-host \
 ## 配置
 
 ### 环境变量
-
-在 OpenClaw gateway 环境中添加：
 
 ```bash
 LANGFUSE_PUBLIC_KEY=pk-lf-xxxxxxxxxxxxxxxxxxxx
@@ -133,14 +171,16 @@ services:
 
 ## 工作原理
 
-插件注册了四个 hook：
+插件注册了 6 类共 12 个 hook：
 
-| Hook | 用途 |
-|------|------|
-| `before_agent_start` | 捕获用户提示词并创建 trace ID |
-| `llm_input` | 在每次 LLM 调用前记录 provider、model、prompt |
-| `llm_output` | 与 `llm_input` 配对，将 `generation-create` 发送到 Langfuse（含 token 用量） |
-| `agent_end` | 将 `trace-create` 发送到 Langfuse（含整体成功/失败状态） |
+| 类别 | Hook | Langfuse 事件类型 |
+|------|------|-------------------|
+| Trace 生命周期 | `before_agent_start`、`agent_end` | `trace-create` |
+| LLM 调用 | `llm_input`、`llm_output` | `generation-create` |
+| 工具调用 | `before_tool_call`、`after_tool_call` | `span-create` |
+| 会话 | `session_start`、`session_end` | `event-create` |
+| 上下文压缩 | `before_compaction`、`after_compaction` | `event-create` |
+| 子 agent | `subagent_spawned`、`subagent_ended` | `span-create` |
 
 插件**静默失败** — 如果密钥缺失、Langfuse 不可达或 ingestion 调用失败，仅记录警告日志并继续运行，不会阻塞 agent。
 
