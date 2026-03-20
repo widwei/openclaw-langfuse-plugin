@@ -37,6 +37,15 @@ function extractText(content, maxLen = MAX_TEXT_LEN) {
   return "";
 }
 
+function extractThinking(lastAssistant) {
+  if (!lastAssistant || !Array.isArray(lastAssistant.content)) return "";
+  return lastAssistant.content
+    .filter((b) => b?.type === "thinking" && typeof b.thinking === "string")
+    .map((b) => b.thinking.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 function resolveKey(ctx) {
   return ctx.sessionKey ?? ctx.agentId ?? "default";
 }
@@ -169,6 +178,7 @@ export function register(api) {
     const now = new Date().toISOString();
     const startTime = new Date(call.startedAt).toISOString();
     const outputText = event.assistantTexts?.join("\n") ?? "";
+    const thinkingText = extractThinking(event.lastAssistant);
 
     const usage = {};
     if (event.usage) {
@@ -184,6 +194,17 @@ export function register(api) {
       ? `[system] ${call.systemPrompt}\n\n${call.prompt}`
       : call.prompt;
 
+    const output = event.lastAssistant ?? truncate(outputText);
+
+    const metadata = {
+      provider: call.provider,
+      agentId: ctx.agentId,
+      sessionKey: ctx.sessionKey,
+    };
+    if (thinkingText) {
+      metadata.thinking = truncate(thinkingText);
+    }
+
     await sendBatch([
       {
         id: crypto.randomUUID(),
@@ -198,14 +219,10 @@ export function register(api) {
           startTime,
           endTime: now,
           input: truncate(inputText),
-          output: truncate(outputText),
+          output,
           usage: Object.keys(usage).length > 1 ? usage : undefined,
           level: "DEFAULT",
-          metadata: {
-            provider: call.provider,
-            agentId: ctx.agentId,
-            sessionKey: ctx.sessionKey,
-          },
+          metadata,
         },
       },
     ]);

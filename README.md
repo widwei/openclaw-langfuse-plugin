@@ -31,9 +31,10 @@ Traces every agent turn with per-LLM-call generations, tool call spans, sub-agen
 | Model | Exact model ID from the LLM call |
 | Provider | `anthropic`, `openai`, `ollama`, etc. |
 | Input | System prompt + user prompt |
-| Output | Full assistant response text |
+| Output | Full assistant message (structured JSON with thinking + text content blocks) |
 | Token usage | `input`, `output`, `inputCached`, `inputCacheWrite`, `total` |
 | Duration | Per-call start → end time |
+| Metadata | `provider`, `agentId`, `sessionKey`, `thinking` (reasoning text, when present) |
 
 ### Span (per tool call)
 

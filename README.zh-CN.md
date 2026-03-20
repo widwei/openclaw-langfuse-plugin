@@ -31,9 +31,10 @@
 | Model | LLM 调用的精确模型 ID |
 | Provider | `anthropic`、`openai`、`ollama` 等 |
 | Input | 系统提示词 + 用户提示词 |
-| Output | 完整的助手回复文本 |
+| Output | 完整的助手消息（结构化 JSON，包含 thinking + text 内容块） |
 | Token 用量 | `input`、`output`、`inputCached`、`inputCacheWrite`、`total` |
 | 耗时 | 单次调用的起止时间 |
+| Metadata | `provider`、`agentId`、`sessionKey`、`thinking`（推理文本，存在时记录） |
 
 ### Span（每次工具调用）
 
