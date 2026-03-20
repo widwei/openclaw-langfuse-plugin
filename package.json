@@ -18,6 +18,9 @@
     "type": "git",
     "url": "https://github.com/openclaw/openclaw-langfuse-plugin"
   },
+  "dependencies": {
+    "langfuse": "^3.38.6"
+  },
   "engines": {
     "node": ">=22"
   }
