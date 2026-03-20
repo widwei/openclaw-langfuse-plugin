@@ -46,6 +46,7 @@ function extractThinking(lastAssistant) {
     .join("\n");
 }
 
+
 function resolveKey(ctx) {
   return ctx.sessionKey ?? ctx.agentId ?? "default";
 }
@@ -451,22 +452,24 @@ export function register(api) {
   // ════════════════════════════════════════════════════════════════════════════
 
   async function sendBatch(batch) {
+    const types = batch.map((b) => b.type).join(",");
     try {
+      const payload = JSON.stringify({ batch });
       const res = await fetch(`${baseUrl}/api/public/ingestion`, {
         method: "POST",
         headers: {
           Authorization: authHeader,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ batch }),
+        body: payload,
         signal: AbortSignal.timeout(10_000),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
-        api.logger.warn(`[openclaw-langfuse] ingestion failed ${res.status}: ${text.slice(0, 300)}`);
+        api.logger.warn(`[openclaw-langfuse] ingestion failed [${types}] ${res.status}: ${text.slice(0, 500)}`);
       }
     } catch (err) {
-      api.logger.warn(`[openclaw-langfuse] fetch error: ${String(err)}`);
+      api.logger.warn(`[openclaw-langfuse] fetch error [${types}]: ${String(err)}`);
     }
   }
 }
